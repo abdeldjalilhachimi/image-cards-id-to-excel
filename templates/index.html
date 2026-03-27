@@ -257,13 +257,9 @@
           throw new Error(txt || `Server error ${resp.status}`);
         }
 
-        const blob = await resp.blob();
-        const url  = URL.createObjectURL(blob);
-        const a    = document.createElement('a');
-        a.href     = url;
-        a.download = 'nin_data.xlsx';
-        a.click();
-        URL.revokeObjectURL(url);
+        const data = await resp.json();
+        // Plain GET → browser handles Content-Disposition: attachment automatically
+        window.location.href = '/download/' + data.token;
 
         setStatus(`Done! ${files.length} card(s) processed. Download started.`, 'ok');
       } catch (err) {

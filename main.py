@@ -1,16 +1,20 @@
 import io
 import re
+import uuid
 
 import easyocr
 import numpy as np
 import openpyxl
-from PIL import Image
-from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from PIL import Image, ImageEnhance
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 app = FastAPI(title="Algerian ID Card Extractor")
 templates = Jinja2Templates(directory="templates")
+
+# Temporary in-memory store: token → xlsx bytes
+_download_store: dict[str, bytes] = {}
 
 # Loaded once at startup — first run downloads ~100 MB of models
 print("Loading OCR models (Arabic + Latin)…")
@@ -42,8 +46,20 @@ NIN_SPACED_RE = re.compile(r"\d[\d ]{16,20}\d")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _normalize_arabic(text: str) -> str:
+    """Strip Arabic diacritics and normalize visually-similar characters."""
+    # Remove harakat (diacritics: fatha, damma, kasra, etc.)
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
+    # Normalize alef variants → bare alef (OCR often confuses أ / إ / آ / ا)
+    text = re.sub(r"[أإآٱ]", "ا", text)
+    # Normalize alef maqsura → ya
+    text = re.sub(r"ى", "ي", text)
+    return text
+
+
 def _norm(text: str) -> str:
-    """Strip punctuation, collapse spaces, uppercase — for label comparison."""
+    """Strip punctuation, normalize Arabic, collapse spaces, uppercase."""
+    text = _normalize_arabic(text)
     return re.sub(r"[:\-–./]", "", text).strip().upper()
 
 
@@ -63,6 +79,9 @@ def _is_valid_name(text: str) -> bool:
     # Reject pure digit / punctuation strings (NIN fragments, dates, codes)
     if re.match(r'^[\d\s\-/.:,]+$', t):
         return False
+    # Reject anything containing a colon — names never have colons, label fragments always do
+    if ":" in t:
+        return False
     # Must have at least 2 meaningful characters
     letters = [c for c in t if c.isalpha()]
     return len(letters) >= 2
@@ -75,6 +94,59 @@ def _is_latin(text: str) -> bool:
 
 
 # ── Core extraction ───────────────────────────────────────────────────────────
+
+def _collect_same_row(i: int, texts: list, bboxes: list) -> str:
+    """
+    Collect valid-name blocks on the same row as block i (the label).
+    Rules:
+      - Same row  : center-Y within 1.2 × max(label height, candidate height)
+      - Direction : Arabic is RTL → value block must be to the LEFT of the label
+      - Proximity : candidate's right edge must be within max(300px, 4×label_width)
+                    of the label's left edge (ignores far-away watermarks / city names)
+    Results joined in RTL reading order (highest X first = first Arabic word).
+    """
+    label_bbox    = bboxes[i]
+    label_top     = label_bbox[0][1]
+    label_bottom  = label_bbox[2][1]
+    label_center  = (label_top + label_bottom) / 2
+    label_h       = max(label_bottom - label_top, 1)
+    label_left_x  = label_bbox[0][0]
+    label_w       = max(label_bbox[1][0] - label_bbox[0][0], 1)
+    max_x_gap     = max(300, label_w * 4)   # generous but bounded proximity limit
+
+    matches = []
+    for j, (t, b) in enumerate(zip(texts, bboxes)):
+        if j == i:
+            continue
+        cand_top     = b[0][1]
+        cand_bottom  = b[2][1]
+        cand_center  = (cand_top + cand_bottom) / 2
+        cand_right_x = b[1][0]
+
+        # ── Row check ────────────────────────────────────────────────────────
+        row_thresh = 1.2 * max(label_h, cand_bottom - cand_top, 1)
+        if abs(cand_center - label_center) > row_thresh:
+            continue
+
+        # ── Direction check (RTL: value is to the LEFT of the label) ─────────
+        if cand_right_x > label_left_x:
+            continue   # block starts to the right of / overlaps the label
+
+        # ── Proximity check (not a far-away unrelated block) ─────────────────
+        x_gap = label_left_x - cand_right_x
+        if x_gap > max_x_gap:
+            continue
+
+        if _is_valid_name(t):
+            matches.append((b[0][0], t))   # (left-x, text)
+
+    if not matches:
+        return ""
+    # Sort by X descending = RTL reading order (rightmost word first)
+    matches.sort(key=lambda m: m[0], reverse=True)
+    return " ".join(t for _, t in matches)
+
+
 
 def _extract_inline_value(text: str, label: str) -> str:
     """
@@ -89,7 +161,7 @@ def _extract_inline_value(text: str, label: str) -> str:
         if label in part:
             # value is the adjacent part (before or after)
             if idx + 1 < len(parts) and parts[idx + 1]:
-                return parts[idx + 1]
+                return parts[idx + 1].strip()
             if idx - 1 >= 0 and parts[idx - 1]:
                 return parts[idx - 1]
     return ""
@@ -125,9 +197,10 @@ def extract_fields(ocr_results: list) -> dict:
         label_y = bboxes[i][0][1]
 
         # ── Strategy 1: inline "label: value" in the same OCR block ──────────
+        text_norm_ar = _normalize_arabic(text)
         if not lastname:
             for label in LASTNAME_LABELS:
-                if label in text:
+                if _normalize_arabic(label) in text_norm_ar:
                     val = _extract_inline_value(text, label)
                     if val and _is_valid_name(val):
                         lastname = val
@@ -135,7 +208,7 @@ def extract_fields(ocr_results: list) -> dict:
 
         if not firstname:
             for label in FIRSTNAME_LABELS:
-                if label in text:
+                if _normalize_arabic(label) in text_norm_ar:
                     val = _extract_inline_value(text, label)
                     if val and _is_valid_name(val):
                         firstname = val
@@ -143,15 +216,11 @@ def extract_fields(ocr_results: list) -> dict:
 
         # ── Strategy 2: standalone label → search nearby blocks ──────────────
         if norm in lastname_labels_norm and not lastname:
-            # Same row first (Arabic RTL: value block is to the left)
-            for j, (t, b) in enumerate(zip(texts, bboxes)):
-                if j == i:
-                    continue
-                if abs(b[0][1] - label_y) <= 40 and _is_valid_name(t):
-                    lastname = t
-                    break
-            # Fallback: next blocks below
-            if not lastname:
+            val = _collect_same_row(i, texts, bboxes)
+            if val:
+                lastname = val
+            else:
+                # Fallback: next blocks below
                 for j in range(i + 1, min(i + 8, len(texts))):
                     candidate = texts[j].strip()
                     if abs(bboxes[j][0][1] - label_y) > 200:
@@ -161,13 +230,10 @@ def extract_fields(ocr_results: list) -> dict:
                         break
 
         elif norm in firstname_labels_norm and not firstname:
-            for j, (t, b) in enumerate(zip(texts, bboxes)):
-                if j == i:
-                    continue
-                if abs(b[0][1] - label_y) <= 40 and _is_valid_name(t):
-                    firstname = t
-                    break
-            if not firstname:
+            val = _collect_same_row(i, texts, bboxes)
+            if val:
+                firstname = val
+            else:
                 for j in range(i + 1, min(i + 8, len(texts))):
                     candidate = texts[j].strip()
                     if abs(bboxes[j][0][1] - label_y) > 200:
@@ -181,8 +247,25 @@ def extract_fields(ocr_results: list) -> dict:
 
 # ── Image processing ──────────────────────────────────────────────────────────
 
+def _preprocess(img: Image.Image) -> Image.Image:
+    """
+    Improve OCR accuracy:
+    - Convert to grayscale (removes colour noise)
+    - Upscale to at least 1400 px wide (helps with PDF-converted or small images)
+    - Mild contrast boost
+    """
+    gray = img.convert("L")
+    w, h = gray.size
+    if w < 1400:
+        scale = 1400 / w
+        gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    gray = ImageEnhance.Contrast(gray).enhance(1.4)
+    return gray.convert("RGB")
+
+
 def process_image(image_bytes: bytes) -> dict:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img = _preprocess(img)
     img_np = np.array(img)
     results = reader.readtext(img_np)
     return extract_fields(results)
@@ -249,25 +332,21 @@ async def extract(files: list[UploadFile] = File(...)):
         image_bytes = await upload.read()
         try:
             data = process_image(image_bytes)
-            results.append(
-                {
-                    "filename": upload.filename,
-                    **data,
-                    "error": None,
-                }
-            )
+            results.append({"filename": upload.filename, **data, "error": None})
         except Exception as e:
-            results.append(
-                {
-                    "filename": upload.filename,
-                    "nin": "",
-                    "lastname": "",
-                    "firstname": "",
-                    "error": str(e),
-                }
-            )
+            results.append({"filename": upload.filename, "nin": "", "lastname": "", "firstname": "", "error": str(e)})
 
     xlsx_bytes = build_xlsx(results)
+    token = str(uuid.uuid4())
+    _download_store[token] = xlsx_bytes
+    return JSONResponse({"token": token})
+
+
+@app.get("/download/{token}")
+async def download(token: str):
+    xlsx_bytes = _download_store.pop(token, None)
+    if not xlsx_bytes:
+        raise HTTPException(status_code=404, detail="File not found or already downloaded")
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
