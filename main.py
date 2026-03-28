@@ -32,10 +32,29 @@ LASTNAME_LABELS = {
 FIRSTNAME_LABELS = {
     "PRÉNOM",
     "PRENOM",
-    "الإسم",        # given name (Algerian ID spelling)
+    "الإسم",        # given name (Algerian ID spelling with hamza)
     "الاسم",        # alternate spelling without hamza
     "الإسم الشخصي",
     "الاسم الشخصي",
+}
+# All OTHER field labels on Algerian ID cards — must never be mistaken for names
+NON_NAME_LABELS = {
+    "الجنس",                 # gender
+    "تاريخ الميلاد",         # date of birth
+    "مكان الميلاد",          # place of birth
+    "سلطة الإصدار",          # issuing authority
+    "تاريخ الإصدار",         # issue date
+    "تاريخ الانتهاء",        # expiry date
+    "تاريخ الإنتهاء",
+    "رقم التعريف الوطني",    # NIN label
+    "رقم بطاقة التعريف",     # card number label
+    "الجنسية",               # nationality
+    "ذكر",                   # male
+    "أنثى",                  # female
+    "الجمهورية الجزائرية",   # header text
+    "بطاقة التعريف الوطنية", # header text
+    "Rh",                    # blood type label
+    "RH",
 }
 
 # NIN on Algerian ID cards = 18 consecutive digits
@@ -65,7 +84,7 @@ def _norm(text: str) -> str:
 
 def _is_label(text: str) -> bool:
     n = _norm(text)
-    all_labels = {_norm(l) for l in LASTNAME_LABELS | FIRSTNAME_LABELS}
+    all_labels = {_norm(l) for l in LASTNAME_LABELS | FIRSTNAME_LABELS | NON_NAME_LABELS}
     return n in all_labels
 
 
@@ -82,9 +101,9 @@ def _is_valid_name(text: str) -> bool:
     # Reject anything containing a colon — names never have colons, label fragments always do
     if ":" in t:
         return False
-    # Must have at least 2 meaningful characters
+    # Must have at least 3 meaningful characters (filters "Rh", "O+", single chars…)
     letters = [c for c in t if c.isalpha()]
-    return len(letters) >= 2
+    return len(letters) >= 3
 
 
 def _is_latin(text: str) -> bool:
@@ -124,7 +143,7 @@ def _collect_same_row(i: int, texts: list, bboxes: list) -> str:
         cand_right_x = b[1][0]
 
         # ── Row check ────────────────────────────────────────────────────────
-        row_thresh = 1.2 * max(label_h, cand_bottom - cand_top, 1)
+        row_thresh = 1.8 * max(label_h, cand_bottom - cand_top, 1)
         if abs(cand_center - label_center) > row_thresh:
             continue
 
@@ -157,9 +176,10 @@ def _extract_inline_value(text: str, label: str) -> str:
     if ":" not in text:
         return ""
     parts = [p.strip() for p in text.split(":")]
+    label_norm = _normalize_arabic(label)
     for idx, part in enumerate(parts):
-        if label in part:
-            # value is the adjacent part (before or after)
+        # Normalize both sides so إ/ا/ى differences don't cause misses
+        if label_norm in _normalize_arabic(part):
             if idx + 1 < len(parts) and parts[idx + 1]:
                 return parts[idx + 1].strip()
             if idx - 1 >= 0 and parts[idx - 1]:

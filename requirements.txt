@@ -1,3 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.1.2+cpu
+torchvision==0.16.2+cpu
+opencv-python-headless==4.9.0.80
+scipy==1.11.4
 fastapi==0.115.6
 uvicorn==0.32.1
 easyocr==1.7.2
@@ -6,3 +11,4 @@ python-multipart==0.0.20
 jinja2==3.1.5
 pillow==11.1.0
 numpy==1.26.4
+python-bidi==0.4.2
