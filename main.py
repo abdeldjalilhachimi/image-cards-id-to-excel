@@ -1,10 +1,12 @@
+import asyncio
 import io
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
-import easyocr
 import numpy as np
 import openpyxl
+import pytesseract
 from PIL import Image, ImageEnhance
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -16,10 +18,12 @@ templates = Jinja2Templates(directory="templates")
 # Temporary in-memory store: token → xlsx bytes
 _download_store: dict[str, bytes] = {}
 
-# Loaded once at startup — first run downloads ~100 MB of models
-print("Loading OCR models (Arabic + Latin)…")
-reader = easyocr.Reader(["ar", "en"], gpu=False)
-print("OCR models ready.")
+# Tesseract config: Arabic + French + English (digits/Latin), LSTM engine
+_TESS_CONFIG = "--oem 3 --psm 3"
+_TESS_LANG   = "ara+fra+eng"
+
+# Tesseract is thread-safe and light on RAM — 4 parallel workers is safe
+_executor = ThreadPoolExecutor(max_workers=4)
 
 # ── Label sets ────────────────────────────────────────────────────────────────
 # French and Arabic variants found on Algerian national ID cards
@@ -67,11 +71,8 @@ NIN_SPACED_RE = re.compile(r"\d[\d ]{16,20}\d")
 
 def _normalize_arabic(text: str) -> str:
     """Strip Arabic diacritics and normalize visually-similar characters."""
-    # Remove harakat (diacritics: fatha, damma, kasra, etc.)
     text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
-    # Normalize alef variants → bare alef (OCR often confuses أ / إ / آ / ا)
     text = re.sub(r"[أإآٱ]", "ا", text)
-    # Normalize alef maqsura → ya
     text = re.sub(r"ى", "ي", text)
     return text
 
@@ -95,13 +96,10 @@ def _is_valid_name(text: str) -> bool:
         return False
     if _is_label(t):
         return False
-    # Reject pure digit / punctuation strings (NIN fragments, dates, codes)
     if re.match(r'^[\d\s\-/.:,]+$', t):
         return False
-    # Reject anything containing a colon — names never have colons, label fragments always do
     if ":" in t:
         return False
-    # Must have at least 3 meaningful characters (filters "Rh", "O+", single chars…)
     letters = [c for c in t if c.isalpha()]
     return len(letters) >= 3
 
@@ -112,26 +110,50 @@ def _is_latin(text: str) -> bool:
     return latin > len(text) * 0.5
 
 
+def _clean_name(text: str) -> str:
+    """
+    Remove OCR noise tokens from an extracted name.
+    Handles cases like 'سميرة 7 HS' → 'سميرة':
+      - Pure-digit tokens  ('7', '19')
+      - Short ASCII tokens (≤2 chars) mixed into Arabic text ('HS', 'ID', 'Rh')
+      - Tokens that are mostly non-alphabetic (punctuation fragments)
+    """
+    if not text:
+        return text
+    has_arabic = any("\u0600" <= c <= "\u06FF" for c in text)
+    clean = []
+    for tok in text.split():
+        if re.fullmatch(r"\d+", tok):
+            continue                                     # pure digit
+        if has_arabic and len(tok) <= 2 and tok.isascii():
+            continue                                     # short Latin noise in Arabic name
+        alpha = [c for c in tok if c.isalpha()]
+        if len(alpha) < max(1, len(tok) * 0.5):
+            continue                                     # mostly punctuation / digits
+        clean.append(tok)
+    return " ".join(clean).strip()
+
+
 # ── Core extraction ───────────────────────────────────────────────────────────
 
-def _collect_same_row(i: int, texts: list, bboxes: list) -> str:
+def _collect_same_row(i: int, texts: list, bboxes: list, rtl: bool = True) -> str:
     """
     Collect valid-name blocks on the same row as block i (the label).
-    Rules:
-      - Same row  : center-Y within 1.2 × max(label height, candidate height)
-      - Direction : Arabic is RTL → value block must be to the LEFT of the label
-      - Proximity : candidate's right edge must be within max(300px, 4×label_width)
-                    of the label's left edge (ignores far-away watermarks / city names)
-    Results joined in RTL reading order (highest X first = first Arabic word).
+
+    rtl=True  (Arabic labels): value is to the LEFT  of the label.
+    rtl=False (French labels): value is to the RIGHT of the label.
+
+    Proximity capped at max(300px, 4×label_width) to ignore far watermarks.
     """
-    label_bbox    = bboxes[i]
-    label_top     = label_bbox[0][1]
-    label_bottom  = label_bbox[2][1]
-    label_center  = (label_top + label_bottom) / 2
-    label_h       = max(label_bottom - label_top, 1)
-    label_left_x  = label_bbox[0][0]
-    label_w       = max(label_bbox[1][0] - label_bbox[0][0], 1)
-    max_x_gap     = max(300, label_w * 4)   # generous but bounded proximity limit
+    label_bbox   = bboxes[i]
+    label_top    = label_bbox[0][1]
+    label_bottom = label_bbox[2][1]
+    label_center = (label_top + label_bottom) / 2
+    label_h      = max(label_bottom - label_top, 1)
+    label_left_x = label_bbox[0][0]
+    label_right_x= label_bbox[1][0]
+    label_w      = max(label_right_x - label_left_x, 1)
+    max_x_gap    = max(300, label_w * 4)
 
     matches = []
     for j, (t, b) in enumerate(zip(texts, bboxes)):
@@ -140,31 +162,34 @@ def _collect_same_row(i: int, texts: list, bboxes: list) -> str:
         cand_top     = b[0][1]
         cand_bottom  = b[2][1]
         cand_center  = (cand_top + cand_bottom) / 2
+        cand_left_x  = b[0][0]
         cand_right_x = b[1][0]
 
-        # ── Row check ────────────────────────────────────────────────────────
         row_thresh = 1.8 * max(label_h, cand_bottom - cand_top, 1)
         if abs(cand_center - label_center) > row_thresh:
             continue
 
-        # ── Direction check (RTL: value is to the LEFT of the label) ─────────
-        if cand_right_x > label_left_x:
-            continue   # block starts to the right of / overlaps the label
-
-        # ── Proximity check (not a far-away unrelated block) ─────────────────
-        x_gap = label_left_x - cand_right_x
-        if x_gap > max_x_gap:
-            continue
+        if rtl:
+            # Arabic RTL: value sits to the LEFT of the label
+            if cand_right_x > label_left_x:
+                continue
+            if label_left_x - cand_right_x > max_x_gap:
+                continue
+        else:
+            # French LTR: value sits to the RIGHT of the label
+            if cand_left_x < label_right_x:
+                continue
+            if cand_left_x - label_right_x > max_x_gap:
+                continue
 
         if _is_valid_name(t):
-            matches.append((b[0][0], t))   # (left-x, text)
+            matches.append((b[0][0], t))
 
     if not matches:
         return ""
-    # Sort by X descending = RTL reading order (rightmost word first)
-    matches.sort(key=lambda m: m[0], reverse=True)
+    # RTL: read highest-X first; LTR: read lowest-X first
+    matches.sort(key=lambda m: m[0], reverse=rtl)
     return " ".join(t for _, t in matches)
-
 
 
 def _extract_inline_value(text: str, label: str) -> str:
@@ -178,7 +203,6 @@ def _extract_inline_value(text: str, label: str) -> str:
     parts = [p.strip() for p in text.split(":")]
     label_norm = _normalize_arabic(label)
     for idx, part in enumerate(parts):
-        # Normalize both sides so إ/ا/ى differences don't cause misses
         if label_norm in _normalize_arabic(part):
             if idx + 1 < len(parts) and parts[idx + 1]:
                 return parts[idx + 1].strip()
@@ -188,14 +212,11 @@ def _extract_inline_value(text: str, label: str) -> str:
 
 
 def extract_fields(ocr_results: list) -> dict:
-    # Sort top → bottom, then left → right
     sorted_res = sorted(ocr_results, key=lambda r: (r[0][0][1], r[0][0][0]))
-    texts = [r[1].strip() for r in sorted_res]
-    bboxes = [r[0] for r in sorted_res]
+    texts  = [r[1].strip() for r in sorted_res]
+    bboxes = [r[0]         for r in sorted_res]
 
-    nin = ""
-    lastname = ""
-    firstname = ""
+    nin = lastname = firstname = ""
 
     # ── NIN ──────────────────────────────────────────────────────────────────
     full_digits_only = re.sub(r"\s", "", " ".join(texts))
@@ -203,25 +224,25 @@ def extract_fields(ocr_results: list) -> dict:
     if m:
         nin = m.group()
     else:
-        full_spaced = " ".join(texts)
-        m2 = NIN_SPACED_RE.search(full_spaced)
+        m2 = NIN_SPACED_RE.search(" ".join(texts))
         if m2:
             nin = re.sub(r"\s", "", m2.group())
 
     # ── Names ─────────────────────────────────────────────────────────────────
-    lastname_labels_norm = {_norm(l) for l in LASTNAME_LABELS}
+    lastname_labels_norm  = {_norm(l) for l in LASTNAME_LABELS}
     firstname_labels_norm = {_norm(l) for l in FIRSTNAME_LABELS}
 
     for i, text in enumerate(texts):
-        norm = _norm(text)
+        norm    = _norm(text)
         label_y = bboxes[i][0][1]
 
-        # ── Strategy 1: inline "label: value" in the same OCR block ──────────
         text_norm_ar = _normalize_arabic(text)
+
+        # ── Strategy 1: inline "label: value" in the same OCR block ──────────
         if not lastname:
             for label in LASTNAME_LABELS:
                 if _normalize_arabic(label) in text_norm_ar:
-                    val = _extract_inline_value(text, label)
+                    val = _clean_name(_extract_inline_value(text, label))
                     if val and _is_valid_name(val):
                         lastname = val
                         break
@@ -229,35 +250,43 @@ def extract_fields(ocr_results: list) -> dict:
         if not firstname:
             for label in FIRSTNAME_LABELS:
                 if _normalize_arabic(label) in text_norm_ar:
-                    val = _extract_inline_value(text, label)
+                    val = _clean_name(_extract_inline_value(text, label))
                     if val and _is_valid_name(val):
                         firstname = val
                         break
 
-        # ── Strategy 2: standalone label → search nearby blocks ──────────────
-        if norm in lastname_labels_norm and not lastname:
-            val = _collect_same_row(i, texts, bboxes)
+        # ── Strategy 2: standalone label → same-row search (RTL then LTR) ────
+        is_lastname_label  = norm in lastname_labels_norm
+        is_firstname_label = norm in firstname_labels_norm
+
+        if is_lastname_label and not lastname:
+            # Try RTL (Arabic) then LTR (French)
+            val = _collect_same_row(i, texts, bboxes, rtl=True) or \
+                  _collect_same_row(i, texts, bboxes, rtl=False)
             if val:
-                lastname = val
+                lastname = _clean_name(val)
             else:
-                # Fallback: next blocks below
+                # Fallback: scan blocks immediately below the label
                 for j in range(i + 1, min(i + 8, len(texts))):
                     candidate = texts[j].strip()
                     if abs(bboxes[j][0][1] - label_y) > 200:
                         break
+                    candidate = _clean_name(candidate)
                     if _is_valid_name(candidate):
                         lastname = candidate
                         break
 
-        elif norm in firstname_labels_norm and not firstname:
-            val = _collect_same_row(i, texts, bboxes)
+        elif is_firstname_label and not firstname:
+            val = _collect_same_row(i, texts, bboxes, rtl=True) or \
+                  _collect_same_row(i, texts, bboxes, rtl=False)
             if val:
-                firstname = val
+                firstname = _clean_name(val)
             else:
                 for j in range(i + 1, min(i + 8, len(texts))):
                     candidate = texts[j].strip()
                     if abs(bboxes[j][0][1] - label_y) > 200:
                         break
+                    candidate = _clean_name(candidate)
                     if _is_valid_name(candidate):
                         firstname = candidate
                         break
@@ -265,29 +294,77 @@ def extract_fields(ocr_results: list) -> dict:
     return {"nin": nin, "lastname": lastname, "firstname": firstname}
 
 
+# ── OCR engine (Tesseract) ────────────────────────────────────────────────────
+
+def _run_ocr(img: Image.Image) -> list:
+    """
+    Run Tesseract on a PIL image and return results in the same format
+    extract_fields() expects:  [ [[x1,y1],[x2,y1],[x2,y2],[x1,y2]], text, conf ], …
+    Words are grouped back into lines so inline "label: value" patterns work.
+    """
+    data = pytesseract.image_to_data(
+        img,
+        lang=_TESS_LANG,
+        config=_TESS_CONFIG,
+        output_type=pytesseract.Output.DICT,
+    )
+
+    # Group words into lines keyed by (block, paragraph, line)
+    lines: dict = {}
+    for i in range(len(data["text"])):
+        if data["level"][i] != 5:          # level 5 = word
+            continue
+        word = data["text"][i].strip()
+        conf = int(data["conf"][i])
+        if conf < 30 or not word:          # skip low-confidence garbage
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        if key not in lines:
+            lines[key] = {"words": [], "xs": [], "ys": [], "x2s": [], "y2s": []}
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        lines[key]["words"].append(word)
+        lines[key]["xs"].append(x)
+        lines[key]["ys"].append(y)
+        lines[key]["x2s"].append(x + w)
+        lines[key]["y2s"].append(y + h)
+
+    results = []
+    for line in lines.values():
+        text = " ".join(line["words"])
+        x1, y1 = min(line["xs"]), min(line["ys"])
+        x2, y2 = max(line["x2s"]), max(line["y2s"])
+        bbox = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        results.append([bbox, text, 0.9])   # fixed conf; Tesseract line-level conf is unreliable
+
+    return results
+
+
 # ── Image processing ──────────────────────────────────────────────────────────
 
 def _preprocess(img: Image.Image) -> Image.Image:
     """
-    Improve OCR accuracy:
-    - Convert to grayscale (removes colour noise)
-    - Upscale to at least 1400 px wide (helps with PDF-converted or small images)
-    - Mild contrast boost
+    Prepare image for Tesseract:
+    - Grayscale removes colour noise
+    - Keep between 1200–1800 px wide (300 DPI equivalent for a standard ID card)
+    - Contrast boost sharpens faint print
+    - BILINEAR is 3× faster than LANCZOS with no visible quality loss here
     """
     gray = img.convert("L")
     w, h = gray.size
-    if w < 1400:
-        scale = 1400 / w
-        gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    gray = ImageEnhance.Contrast(gray).enhance(1.4)
-    return gray.convert("RGB")
+    if w < 1200:
+        scale = 1200 / w
+        gray = gray.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    elif w > 1800:
+        scale = 1800 / w
+        gray = gray.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    gray = ImageEnhance.Contrast(gray).enhance(1.5)
+    return gray
 
 
 def process_image(image_bytes: bytes) -> dict:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img = _preprocess(img)
-    img_np = np.array(img)
-    results = reader.readtext(img_np)
+    results = _run_ocr(img)
     return extract_fields(results)
 
 
@@ -304,14 +381,12 @@ def build_xlsx(rows: list[dict]) -> bytes:
         cell.font = openpyxl.styles.Font(bold=True)
 
     for row in rows:
-        ws.append(
-            [
-                row.get("filename", ""),
-                row.get("nin", ""),
-                row.get("lastname", ""),
-                row.get("firstname", ""),
-            ]
-        )
+        ws.append([
+            row.get("filename", ""),
+            row.get("nin", ""),
+            row.get("lastname", ""),
+            row.get("firstname", ""),
+        ])
 
     for col in ws.columns:
         max_len = max(len(str(cell.value or "")) for cell in col)
@@ -332,12 +407,11 @@ async def index(request: Request):
 
 @app.post("/debug")
 async def debug(file: UploadFile = File(...)):
-    """Return raw OCR blocks so you can see exactly what EasyOCR detects."""
-    from fastapi.responses import JSONResponse
+    """Return raw OCR lines so you can inspect what Tesseract detects."""
     image_bytes = await file.read()
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img_np = np.array(img)
-    results = reader.readtext(img_np)
+    img = _preprocess(img)
+    results = _run_ocr(img)
     blocks = [
         {"text": r[1], "confidence": round(r[2], 3), "bbox": r[0]}
         for r in sorted(results, key=lambda r: r[0][0][1])
@@ -347,14 +421,20 @@ async def debug(file: UploadFile = File(...)):
 
 @app.post("/extract")
 async def extract(files: list[UploadFile] = File(...)):
+    # Read all uploads first (async I/O, non-blocking)
+    uploads = [(f.filename, await f.read()) for f in files]
+
+    # Run OCR in parallel — Tesseract is thread-safe and low-memory
+    loop = asyncio.get_event_loop()
+    tasks = [loop.run_in_executor(_executor, process_image, data) for _, data in uploads]
+    ocr_results = await asyncio.gather(*tasks, return_exceptions=True)
+
     results = []
-    for upload in files:
-        image_bytes = await upload.read()
-        try:
-            data = process_image(image_bytes)
-            results.append({"filename": upload.filename, **data, "error": None})
-        except Exception as e:
-            results.append({"filename": upload.filename, "nin": "", "lastname": "", "firstname": "", "error": str(e)})
+    for (filename, _), data in zip(uploads, ocr_results):
+        if isinstance(data, Exception):
+            results.append({"filename": filename, "nin": "", "lastname": "", "firstname": "", "error": str(data)})
+        else:
+            results.append({"filename": filename, **data, "error": None})
 
     xlsx_bytes = build_xlsx(results)
     token = str(uuid.uuid4())

@@ -1,11 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.11.0+cpu
-torchvision==0.26.0+cpu
-opencv-python-headless==4.9.0.80
-scipy==1.11.4
 fastapi==0.115.6
 uvicorn==0.32.1
-easyocr==1.7.2
+pytesseract==0.3.13
 openpyxl==3.1.5
 python-multipart==0.0.20
 jinja2==3.1.5
