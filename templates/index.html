@@ -1,17 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ar" dir="rtl">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NIN Extractor — Algerian ID Cards</title>
+  <title>استخراج رقم التعريف الوطني — بطاقات الهوية الجزائرية</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: "Segoe UI", Tahoma, Arial, sans-serif;
       background: #f0f4f8;
       min-height: 100vh;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
       padding: 2rem;
@@ -95,7 +96,7 @@
     .file-item svg { flex-shrink: 0; color: #68d391; }
 
     .file-item .remove {
-      margin-left: auto;
+      margin-right: auto;
       cursor: pointer;
       color: #fc8181;
       font-size: 1.1rem;
@@ -149,30 +150,39 @@
       animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    .copyright {
+      margin-top: 1.5rem;
+      text-align: center;
+      font-size: 0.8rem;
+      color: #a0aec0;
+    }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>NIN Extractor — Algerian ID Cards</h1>
-    <p class="subtitle">Upload one or more ID card photos — NIN, last name, and first name extracted locally (Arabic + French) and exported as Excel.</p>
+    <h1>استخراج رقم التعريف الوطني — بطاقات الهوية الجزائرية</h1>
+    <p class="subtitle">قم برفع صورة أو أكثر لبطاقات الهوية — يتم استخراج رقم التعريف الوطني والاسم واللقب محلياً (عربي + فرنسي) وتصديرها كملف Excel.</p>
 
     <div class="drop-zone" id="dropZone">
       <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
           d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
       </svg>
-      <p>Drag &amp; drop ID card images here, or <span id="browseBtn">browse</span></p>
-      <p style="margin-top:0.4rem;font-size:0.82rem;color:#a0aec0;">JPEG, PNG, WebP supported</p>
+      <p>اسحب وأفلت صور بطاقات الهوية هنا، أو <span id="browseBtn">تصفّح</span></p>
+      <p style="margin-top:0.4rem;font-size:0.82rem;color:#a0aec0;">يدعم صيغ JPEG وPNG وWebP</p>
       <input type="file" id="fileInput" accept="image/*" multiple />
     </div>
 
     <div class="file-list" id="fileList"></div>
 
     <button class="btn" id="submitBtn" disabled>
-      Extract &amp; Download XLSX
+      استخراج وتنزيل ملف XLSX
     </button>
 
     <div class="status" id="status"></div>
+
+    <p class="copyright">© جميع الحقوق محفوظة — Abdeldjalil Hachimi</p>
   </div>
 
   <script>
@@ -220,7 +230,7 @@
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z"/>
           </svg>
           <span>${f.name}</span>
-          <button class="remove" data-idx="${i}" title="Remove">×</button>`;
+          <button class="remove" data-idx="${i}" title="حذف">×</button>`;
         fileList.appendChild(item);
       });
       fileList.querySelectorAll('.remove').forEach(btn => {
@@ -243,8 +253,8 @@
       if (!files.length) return;
 
       submitBtn.disabled = true;
-      submitBtn.innerHTML = '<div class="spinner"></div> Processing…';
-      setStatus(`Running local OCR on ${files.length} image(s) — this may take a few seconds per card…`, 'info');
+      submitBtn.innerHTML = '<div class="spinner"></div> جارٍ المعالجة…';
+      setStatus(`جارٍ تشغيل التعرف الضوئي على ${files.length} صورة — قد يستغرق ذلك بضع ثوانٍ لكل بطاقة…`, 'info');
 
       const form = new FormData();
       files.forEach(f => form.append('files', f));
@@ -254,19 +264,18 @@
 
         if (!resp.ok) {
           const txt = await resp.text();
-          throw new Error(txt || `Server error ${resp.status}`);
+          throw new Error(txt || `خطأ في الخادم ${resp.status}`);
         }
 
         const data = await resp.json();
-        // Plain GET → browser handles Content-Disposition: attachment automatically
         window.location.href = '/download/' + data.token;
 
-        setStatus(`Done! ${files.length} card(s) processed. Download started.`, 'ok');
+        setStatus(`تمّ! تمت معالجة ${files.length} بطاقة. بدأ التنزيل.`, 'ok');
       } catch (err) {
-        setStatus('Error: ' + err.message, 'error');
+        setStatus('خطأ: ' + err.message, 'error');
       } finally {
         submitBtn.disabled = files.length === 0;
-        submitBtn.innerHTML = 'Extract &amp; Download XLSX';
+        submitBtn.innerHTML = 'استخراج وتنزيل ملف XLSX';
       }
     });
   </script>
