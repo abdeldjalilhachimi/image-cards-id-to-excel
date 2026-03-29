@@ -4,7 +4,6 @@ import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import openpyxl
 import pytesseract
 from PIL import Image, ImageEnhance
@@ -18,12 +17,13 @@ templates = Jinja2Templates(directory="templates")
 # Temporary in-memory store: token → xlsx bytes
 _download_store: dict[str, bytes] = {}
 
-# Tesseract config: Arabic + French + English (digits/Latin), LSTM engine
+# Tesseract config: Arabic + French, LSTM engine
 _TESS_CONFIG = "--oem 3 --psm 3"
-_TESS_LANG   = "ara+fra+eng"
+_TESS_LANG   = "ara+fra"
 
-# Tesseract is thread-safe and light on RAM — 4 parallel workers is safe
-_executor = ThreadPoolExecutor(max_workers=4)
+# 256 MB / 0.25 CPU free tier: 1 worker keeps memory under control
+# (each Tesseract job uses ~60 MB; 2+ workers risk OOM)
+_executor = ThreadPoolExecutor(max_workers=1)
 
 # ── Label sets ────────────────────────────────────────────────────────────────
 # French and Arabic variants found on Algerian national ID cards
@@ -36,10 +36,17 @@ LASTNAME_LABELS = {
 FIRSTNAME_LABELS = {
     "PRÉNOM",
     "PRENOM",
+    "PRÉNOMS",      # "Prénom(s)" on some cards — normalized from _norm()
+    "PRENOMS",
     "الإسم",        # given name (Algerian ID spelling with hamza)
     "الاسم",        # alternate spelling without hamza
     "الإسم الشخصي",
     "الاسم الشخصي",
+}
+DOB_LABELS = {
+    "تاريخ الميلاد",       # Arabic: date of birth
+    "DATE DE NAISSANCE",   # French: date of birth
+    "DATE NAISSANCE",
 }
 # All OTHER field labels on Algerian ID cards — must never be mistaken for names
 NON_NAME_LABELS = {
@@ -66,6 +73,12 @@ NIN_RE = re.compile(r"\d{18}")
 # Sometimes OCR inserts spaces inside the number
 NIN_SPACED_RE = re.compile(r"\d[\d ]{16,20}\d")
 
+# Date of birth: YYYY.MM.DD  or  DD.MM.YYYY  (dots, dashes, or slashes)
+# No \b anchors — Arabic chars are \w so boundaries are unreliable here
+DOB_RE = re.compile(
+    r"(?<!\d)(?:\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}|\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4})(?!\d)"
+)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -78,9 +91,9 @@ def _normalize_arabic(text: str) -> str:
 
 
 def _norm(text: str) -> str:
-    """Strip punctuation, normalize Arabic, collapse spaces, uppercase."""
+    """Strip punctuation (incl. parentheses), normalize Arabic, collapse spaces, uppercase."""
     text = _normalize_arabic(text)
-    return re.sub(r"[:\-–./]", "", text).strip().upper()
+    return re.sub(r"[:\-–./()]", "", text).strip().upper()
 
 
 def _is_label(text: str) -> bool:
@@ -195,19 +208,28 @@ def _collect_same_row(i: int, texts: list, bboxes: list, rtl: bool = True) -> st
 def _extract_inline_value(text: str, label: str) -> str:
     """
     On Algerian ID cards labels and values appear on the same line:
-      اللقب: حداق   or   الإسم: مراد
-    Split on ':' and return the part that is NOT the label.
+      اللقب: حداق   or   الإسم: مراد   or   NOM HACHIMI  (no colon)
+    Try colon-split first; fall back to removing the label substring.
     """
-    if ":" not in text:
-        return ""
-    parts = [p.strip() for p in text.split(":")]
-    label_norm = _normalize_arabic(label)
-    for idx, part in enumerate(parts):
-        if label_norm in _normalize_arabic(part):
-            if idx + 1 < len(parts) and parts[idx + 1]:
-                return parts[idx + 1].strip()
-            if idx - 1 >= 0 and parts[idx - 1]:
-                return parts[idx - 1]
+    label_norm_ar = _normalize_arabic(label)
+    text_norm_ar  = _normalize_arabic(text)
+
+    if ":" in text:
+        parts = [p.strip() for p in text.split(":")]
+        for idx, part in enumerate(parts):
+            if label_norm_ar in _normalize_arabic(part):
+                if idx + 1 < len(parts) and parts[idx + 1]:
+                    return parts[idx + 1].strip()
+                if idx - 1 >= 0 and parts[idx - 1]:
+                    return parts[idx - 1]
+
+    # No colon (or colon-split found nothing): strip the label text and return the rest.
+    # Works for "اللقب هاشيمي", "هاشيمي اللقب" (RTL word order), "NOM HACHIMI", etc.
+    if label_norm_ar in text_norm_ar:
+        remainder = text_norm_ar.replace(label_norm_ar, "").strip(" .:-–")
+        if remainder:
+            return remainder
+
     return ""
 
 
@@ -216,7 +238,7 @@ def extract_fields(ocr_results: list) -> dict:
     texts  = [r[1].strip() for r in sorted_res]
     bboxes = [r[0]         for r in sorted_res]
 
-    nin = lastname = firstname = ""
+    nin = lastname = firstname = dob = ""
 
     # ── NIN ──────────────────────────────────────────────────────────────────
     full_digits_only = re.sub(r"\s", "", " ".join(texts))
@@ -228,15 +250,64 @@ def extract_fields(ocr_results: list) -> dict:
         if m2:
             nin = re.sub(r"\s", "", m2.group())
 
-    # ── Names ─────────────────────────────────────────────────────────────────
+    # ── Names + DOB ───────────────────────────────────────────────────────────
     lastname_labels_norm  = {_norm(l) for l in LASTNAME_LABELS}
     firstname_labels_norm = {_norm(l) for l in FIRSTNAME_LABELS}
+    dob_labels_norm       = {_norm(l) for l in DOB_LABELS}
 
     for i, text in enumerate(texts):
         norm    = _norm(text)
         label_y = bboxes[i][0][1]
 
         text_norm_ar = _normalize_arabic(text)
+
+        # ── DOB: inline "تاريخ الميلاد: 1992.12.23" ─────────────────────────
+        if not dob:
+            for label in DOB_LABELS:
+                if _normalize_arabic(label) in _normalize_arabic(text):
+                    # date may be embedded directly in the block
+                    m = DOB_RE.search(text)
+                    if m:
+                        dob = m.group()
+                        break
+                    val = _extract_inline_value(text, label)
+                    if val:
+                        m = DOB_RE.search(val)
+                        if m:
+                            dob = m.group()
+                            break
+
+        # ── DOB: standalone label → same-row or below search ─────────────────
+        if norm in dob_labels_norm and not dob:
+            label_bbox   = bboxes[i]
+            label_top    = label_bbox[0][1]
+            label_bottom = label_bbox[2][1]
+            label_center = (label_top + label_bottom) / 2
+            label_h      = max(label_bottom - label_top, 1)
+            label_y      = label_top
+
+            # search same row (both LTR and RTL positions)
+            for j, (t, b) in enumerate(zip(texts, bboxes)):
+                if j == i:
+                    continue
+                cand_center = (b[0][1] + b[2][1]) / 2
+                row_thresh  = 1.8 * max(label_h, b[2][1] - b[0][1], 1)
+                if abs(cand_center - label_center) > row_thresh:
+                    continue
+                m = DOB_RE.search(t)
+                if m:
+                    dob = m.group()
+                    break
+
+            # fallback: scan blocks immediately below the label
+            if not dob:
+                for j in range(i + 1, min(i + 8, len(texts))):
+                    if abs(bboxes[j][0][1] - label_y) > 200:
+                        break
+                    m = DOB_RE.search(texts[j])
+                    if m:
+                        dob = m.group()
+                        break
 
         # ── Strategy 1: inline "label: value" in the same OCR block ──────────
         if not lastname:
@@ -291,7 +362,78 @@ def extract_fields(ocr_results: list) -> dict:
                         firstname = candidate
                         break
 
-    return {"nin": nin, "lastname": lastname, "firstname": firstname}
+    # ── DOB strategy 3: partial-label match ───────────────────────────────────
+    # Tesseract often splits "تاريخ الميلاد" into two lines so the full label
+    # never appears in a single block.  Match any block containing the
+    # distinctive word "الميلاد" or the French "NAISSANCE" / "NÉ LE".
+    if not dob:
+        for i, text in enumerate(texts):
+            tu = text.upper()
+            if "الميلاد" not in text and "NAISSANCE" not in tu and "NE LE" not in tu and "NÉ LE" not in tu:
+                continue
+            # date may sit inline in this block
+            m = DOB_RE.search(text)
+            if m and len(re.sub(r"\D", "", m.group())) <= 8:
+                dob = m.group()
+                break
+            # or on the same row
+            lb = bboxes[i]
+            lcy = (lb[0][1] + lb[2][1]) / 2
+            lh  = max(lb[2][1] - lb[0][1], 1)
+            for j, (t, b) in enumerate(zip(texts, bboxes)):
+                if j == i:
+                    continue
+                if abs((b[0][1] + b[2][1]) / 2 - lcy) > 1.8 * max(lh, b[2][1] - b[0][1], 1):
+                    continue
+                m = DOB_RE.search(t)
+                if m and len(re.sub(r"\D", "", m.group())) <= 8:
+                    dob = m.group()
+                    break
+            if dob:
+                break
+
+    # ── DOB fallback: nearest-to-label date among all candidates ──────────────
+    # Collect every date-shaped string in the whole OCR output, then pick the
+    # one that is spatially closest to any "الميلاد"/"NAISSANCE" block.
+    # This avoids grabbing the issue date or expiry date by accident.
+    if not dob:
+        # Y-centres of all partial DOB-label blocks
+        label_ys: list[float] = []
+        for text, b in zip(texts, bboxes):
+            tu = text.upper()
+            if "الميلاد" in text or "NAISSANCE" in tu or "NE LE" in tu or "NÉ LE" in tu:
+                label_ys.append((b[0][1] + b[2][1]) / 2)
+
+        # All plausible date candidates (≤ 8 raw digits)
+        candidates: list[tuple[float, str]] = []   # (y_centre, date_string)
+        for text, b in zip(texts, bboxes):
+            m = DOB_RE.search(text)
+            if m:
+                raw = m.group()
+                if len(re.sub(r"\D", "", raw)) <= 8:
+                    cy = (b[0][1] + b[2][1]) / 2
+                    candidates.append((cy, raw))
+
+        if candidates:
+            if label_ys:
+                # Pick the date spatially nearest to any DOB-label block
+                candidates.sort(key=lambda c: min(abs(c[0] - ly) for ly in label_ys))
+                dob = candidates[0][1]
+            else:
+                # No label hint: exclude dates whose row overlaps a non-DOB label
+                non_dob_ys: list[float] = []
+                for text, b in zip(texts, bboxes):
+                    tn = _normalize_arabic(text).upper()
+                    if any(kw in tn for kw in ["الاصدار", "الانتهاء", "الانتهاء",
+                                               "EXPIR", "VALID", "DÉLIVR", "DELIV", "صدر"]):
+                        non_dob_ys.append((b[0][1] + b[2][1]) / 2)
+                for cy, raw in candidates:
+                    if non_dob_ys and min(abs(cy - ny) for ny in non_dob_ys) < 60:
+                        continue
+                    dob = raw
+                    break
+
+    return {"nin": nin, "lastname": lastname, "firstname": firstname, "dob": dob}
 
 
 # ── OCR engine (Tesseract) ────────────────────────────────────────────────────
@@ -316,7 +458,10 @@ def _run_ocr(img: Image.Image) -> list:
             continue
         word = data["text"][i].strip()
         conf = int(data["conf"][i])
-        if conf < 30 or not word:          # skip low-confidence garbage
+        # Digits (dates, NIN) get a lower threshold — OCR often under-scores numbers
+        is_digit_word = bool(re.fullmatch(r"[\d.\-/:,]+", word))
+        min_conf = 10 if is_digit_word else 30
+        if conf < min_conf or not word:    # skip low-confidence garbage
             continue
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
         if key not in lines:
@@ -375,7 +520,7 @@ def build_xlsx(rows: list[dict]) -> bytes:
     ws = wb.active
     ws.title = "ID Cards"
 
-    headers = ["Filename", "NIN", "Last Name", "First Name"]
+    headers = ["Filename", "NIN", "Last Name (اللقب)", "First Name (الإسم)", "Date of Birth (تاريخ الميلاد)"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = openpyxl.styles.Font(bold=True)
@@ -386,6 +531,7 @@ def build_xlsx(rows: list[dict]) -> bytes:
             row.get("nin", ""),
             row.get("lastname", ""),
             row.get("firstname", ""),
+            row.get("dob", ""),
         ])
 
     for col in ws.columns:
@@ -432,7 +578,7 @@ async def extract(files: list[UploadFile] = File(...)):
     results = []
     for (filename, _), data in zip(uploads, ocr_results):
         if isinstance(data, Exception):
-            results.append({"filename": filename, "nin": "", "lastname": "", "firstname": "", "error": str(data)})
+            results.append({"filename": filename, "nin": "", "lastname": "", "firstname": "", "dob": "", "error": str(data)})
         else:
             results.append({"filename": filename, **data, "error": None})
 
